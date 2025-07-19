@@ -27,18 +27,24 @@ jobs:
           echo "Fetching current GitHub Actions IP ranges..."
           curl -s https://api.github.com/meta > github_meta.json
           
-          # Extract Actions IP ranges
-          GITHUB_IPS=$(cat github_meta.json | jq -r '.actions[]' | tr '\n' ',' | sed 's/,$//')
-          echo "GitHub Actions IP ranges: $GITHUB_IPS"
-          echo "GITHUB_IPS=$GITHUB_IPS" >> $GITHUB_ENV
+          # Extract Actions IP ranges and split into groups (Azure NSG limit ~400 per rule)
+          cat github_meta.json | jq -r '.actions[]' > github_ips.txt
           
-          # Also extract git and GitHub ranges for reference
-          GIT_IPS=$(cat github_meta.json | jq -r '.git[]' | tr '\n' ',' | sed 's/,$//')
-          echo "GitHub Git IP ranges: $GIT_IPS"
+          # Count total IPs
+          TOTAL_IPS=$(cat github_ips.txt | wc -l)
+          echo "Total GitHub Actions IP ranges: $TOTAL_IPS"
           
-          # Show all ranges for logging
-          echo "All GitHub IP ranges:"
-          cat github_meta.json | jq '.actions, .git, .hooks, .web, .api, .pages'
+          # Split into chunks of 50 IPs per rule (safe limit)
+          split -l 50 github_ips.txt ip_chunk_
+          
+          # Count chunks
+          CHUNK_COUNT=$(ls ip_chunk_* | wc -l)
+          echo "Will create $CHUNK_COUNT NSG rules"
+          echo "CHUNK_COUNT=$CHUNK_COUNT" >> $GITHUB_ENV
+          
+          # Show sample ranges for logging
+          echo "Sample GitHub Actions IP ranges:"
+          head -10 github_ips.txt
 
       - name: Check Current NSG Rules
         run: |
@@ -66,24 +72,50 @@ jobs:
               --name "$SSH_RULE_NAME-$i" 2>/dev/null || true
           done
 
-      - name: Create Updated SSH Rule for GitHub Actions
+      - name: Create Updated SSH Rules for GitHub Actions
         run: |
-          echo "Creating new SSH rule with updated GitHub Actions IP ranges..."
+          echo "Creating new SSH rules with updated GitHub Actions IP ranges..."
           
-          # Create the main SSH rule allowing GitHub Actions IPs
-          az network nsg rule create \
-            --resource-group $RESOURCE_GROUP \
-            --nsg-name $NSG_NAME \
-            --name $SSH_RULE_NAME \
-            --protocol Tcp \
-            --direction Inbound \
-            --priority 1000 \
-            --source-address-prefixes $GITHUB_IPS \
-            --source-port-ranges '*' \
-            --destination-address-prefixes '*' \
-            --destination-port-ranges 22 \
-            --access Allow \
-            --description "SSH access for GitHub Actions runners - Auto-updated $(date +%Y-%m-%d)"
+          # Create multiple rules for different IP chunks
+          priority=1000
+          rule_number=1
+          
+          for chunk_file in ip_chunk_*; do
+            echo "Processing $chunk_file (Rule $rule_number)..."
+            
+            # Convert chunk to comma-separated list
+            CHUNK_IPS=$(cat "$chunk_file" | tr '\n' ',' | sed 's/,$//')
+            
+            # Create rule name with number suffix
+            if [ $rule_number -eq 1 ]; then
+              RULE_NAME="$SSH_RULE_NAME"
+            else
+              RULE_NAME="$SSH_RULE_NAME-$rule_number"
+            fi
+            
+            echo "Creating rule: $RULE_NAME with priority $priority"
+            echo "IP ranges in this rule: $(cat "$chunk_file" | wc -l)"
+            
+            az network nsg rule create \
+              --resource-group $RESOURCE_GROUP \
+              --nsg-name $NSG_NAME \
+              --name "$RULE_NAME" \
+              --protocol Tcp \
+              --direction Inbound \
+              --priority $priority \
+              --source-address-prefixes $CHUNK_IPS \
+              --source-port-ranges '*' \
+              --destination-address-prefixes '*' \
+              --destination-port-ranges 22 \
+              --access Allow \
+              --description "SSH access for GitHub Actions runners (part $rule_number) - Auto-updated $(date +%Y-%m-%d)"
+            
+            # Increment for next rule
+            priority=$((priority + 1))
+            rule_number=$((rule_number + 1))
+          done
+          
+          echo "Created $((rule_number - 1)) SSH rules for GitHub Actions"
 
       - name: Verify Updated Rules
         run: |
@@ -112,14 +144,9 @@ jobs:
           RUNNER_IP=$(curl -s https://api.ipify.org)
           echo "Current GitHub Actions runner IP: $RUNNER_IP"
           
-          # Check if this IP is in any of the GitHub ranges
-          echo "Checking if runner IP matches GitHub ranges..."
-          echo "$GITHUB_IPS" | tr ',' '\n' | while read -r range; do
-            if [ -n "$range" ]; then
-              echo "Checking range: $range"
-              # This is a simple check - in practice, you'd need more sophisticated IP range checking
-            fi
-          done
+          # Count total IP ranges configured
+          TOTAL_RANGES=$(cat github_ips.txt | wc -l)
+          echo "Total GitHub Actions IP ranges configured: $TOTAL_RANGES"
 
       - name: Display Security Summary
         run: |
@@ -130,21 +157,26 @@ jobs:
           echo "Summary:"
           echo "  • Resource Group: $RESOURCE_GROUP"
           echo "  • NSG Name: $NSG_NAME"
-          echo "  • Rule Name: $SSH_RULE_NAME"
+          echo "  • Base Rule Name: $SSH_RULE_NAME"
+          echo "  • Number of Rules Created: $CHUNK_COUNT"
           echo "  • Updated: $(date)"
           echo ""
           echo "Security Status:"
           echo "  ✅ SSH access restricted to GitHub Actions IP ranges only"
           echo "  ✅ Old rules removed and replaced with current ranges"
-          echo "  ✅ Rule priority set to 1000 (high priority)"
+          echo "  ✅ Multiple rules created to handle all IP ranges"
+          echo "  ✅ Rule priorities starting from 1000"
           echo ""
-          echo "GitHub Actions IP Ranges Currently Allowed:"
-          echo "$GITHUB_IPS" | tr ',' '\n' | sed 's/^/  • /'
+          echo "GitHub Actions IP Ranges:"
+          echo "  • Total IP ranges: $(cat github_ips.txt | wc -l)"
+          echo "  • Rules created: $CHUNK_COUNT"
+          echo "  • Sample ranges:"
+          head -5 github_ips.txt | sed 's/^/    /'
           echo ""
           echo "⚠️  Important Notes:"
-          echo "  • This rule blocks SSH access from all other IPs"
-          echo "  • Emergency access may require Azure Portal or CLI"
-          echo "  • Rule updates automatically weekly"
+          echo "  • This blocks SSH access from all other IPs"
+          echo "  • Emergency access requires Azure Portal or CLI"
+          echo "  • Rules update automatically weekly"
           echo ""
           echo "================================================"
 
