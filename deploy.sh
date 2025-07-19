@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Variables
-RESOURCE_GROUP="n8n-rg"
-LOCATION="eastus"
+RESOURCE_GROUP="Mossync-n8n-prod"
+LOCATION="westus3"
 VM_NAME="n8n-vm"
-ADMIN_USERNAME="n8nadmin"
+ADMIN_USERNAME="mossn8nadmin"
 DNS_PREFIX="n8n-$(date +%s | cut -c6-10)"
 
 # Create resource group
