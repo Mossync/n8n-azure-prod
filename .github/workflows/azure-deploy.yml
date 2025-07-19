@@ -41,7 +41,7 @@ jobs:
 
       - name: Retrieve SSH Public Key from Key Vault
         run: |
-          az keyvault secret download --vault-name $KEYVAULT_NAME --name $SSH_KEY_NAME-public --file id_rsa_n8n.pub
+          az keyvault secret download --vault-name $KEYVAULT_NAME --name $SSH_KEY_NAME-public --file id_rsa_n8n.pub --overwrite
           PUB_KEY=$(cat id_rsa_n8n.pub)
           echo "PUB_KEY<<EOF" >> $GITHUB_ENV
           echo "$PUB_KEY" >> $GITHUB_ENV
