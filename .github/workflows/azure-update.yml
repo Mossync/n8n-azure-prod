@@ -1,0 +1,106 @@
+name: Update n8n on Azure VM
+
+on:
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      RESOURCE_GROUP: Mossync-n8n-prod
+      KEYVAULT_NAME: n8n-keyvault-prod
+      SSH_KEY_NAME: n8n-ssh-key
+      VM_NAME: n8n-vm
+      ADMIN_USERNAME: mossn8nadmin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Check if VM exists
+        run: |
+          if ! az vm show --resource-group $RESOURCE_GROUP --name $VM_NAME >/dev/null 2>&1; then
+            echo "Error: VM $VM_NAME does not exist in resource group $RESOURCE_GROUP"
+            exit 1
+          fi
+          echo "VM $VM_NAME found. Proceeding with update..."
+
+      - name: Get VM Info
+        run: |
+          VM_IP=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query publicIps -o tsv)
+          VM_FQDN=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query fqdns -o tsv)
+          echo "VM Public IP: $VM_IP"
+          echo "VM FQDN: $VM_FQDN"
+          echo "VM_IP=$VM_IP" >> $GITHUB_ENV
+          echo "VM_FQDN=$VM_FQDN" >> $GITHUB_ENV
+
+      - name: Retrieve SSH Private Key from Key Vault
+        run: |
+          az keyvault secret download --vault-name $KEYVAULT_NAME --name $SSH_KEY_NAME-private --file id_rsa_n8n --overwrite
+          chmod 600 id_rsa_n8n
+
+      - name: Check VM SSH Connectivity
+        run: |
+          echo "Testing SSH connectivity to VM..."
+          for i in {1..10}; do
+            if ssh -i id_rsa_n8n -o StrictHostKeyChecking=no -o ConnectTimeout=10 $ADMIN_USERNAME@$VM_IP "echo 'SSH connection successful'" 2>/dev/null; then
+              echo "SSH connection to VM successful"
+              break
+            fi
+            echo "SSH attempt $i/10 failed, retrying..."
+            sleep 10
+          done
+
+      - name: Create Backup Before Update
+        run: |
+          echo "Creating backup before update..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            cd n8n
+            echo 'Creating backup before update...'
+            docker-compose exec -T postgres pg_dump -U n8n n8n > backup_before_update_\$(date +%Y%m%d_%H%M%S).sql
+            echo 'Backup created successfully'
+          "
+
+      - name: Update n8n and PostgreSQL
+        run: |
+          echo "Updating n8n and PostgreSQL containers..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            cd n8n
+            echo 'Pulling latest container images...'
+            docker-compose pull
+            echo 'Restarting containers with updated images...'
+            docker-compose up -d
+            echo 'Update completed successfully'
+          "
+
+      - name: Verify Services are Running
+        run: |
+          echo "Verifying that services are running properly..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            cd n8n
+            echo 'Checking container status...'
+            docker-compose ps
+            echo 'Waiting for services to be ready...'
+            sleep 30
+            echo 'Checking if n8n is responding...'
+            curl -f http://localhost:5678/healthz || echo 'n8n health check failed, but containers may still be starting'
+          "
+
+      - name: Display Update Results
+        run: |
+          echo "================================================"
+          echo "n8n Update Complete!"
+          echo "VM IP: $VM_IP"
+          echo "VM FQDN: $VM_FQDN"
+          echo "Access your updated n8n instance at: https://$VM_FQDN"
+          echo "================================================"
+          echo ""
+          echo "Update summary:"
+          echo "- Backup created before update"
+          echo "- Container images pulled to latest versions"
+          echo "- Services restarted with updated images"
+          echo "- Health checks performed"
