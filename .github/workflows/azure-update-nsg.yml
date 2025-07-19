@@ -2,9 +2,6 @@ name: Update Azure NSG with GitHub Actions IPs
 
 on:
   workflow_dispatch:
-  schedule:
-    # Run weekly on Sundays at 1:00 AM UTC to keep GitHub IPs updated
-    - cron: '0 1 * * 0'
 
 jobs:
   update-nsg:
@@ -34,8 +31,8 @@ jobs:
           TOTAL_IPS=$(cat github_ips.txt | wc -l)
           echo "Total GitHub Actions IP ranges: $TOTAL_IPS"
           
-          # Split into chunks of 50 IPs per rule (safe limit)
-          split -l 50 github_ips.txt ip_chunk_
+          # Split into chunks of 200 IPs per rule (well within Azure's 4000 limit)
+          split -l 200 github_ips.txt ip_chunk_
           
           # Count chunks
           CHUNK_COUNT=$(ls ip_chunk_* | wc -l)
@@ -64,8 +61,8 @@ jobs:
             --nsg-name $NSG_NAME \
             --name $SSH_RULE_NAME 2>/dev/null || echo "No existing rule to delete"
           
-          # Also clean up any numbered rules from previous versions
-          for i in {1..10}; do
+          # Also clean up any numbered rules from previous versions (up to 50 rules)
+          for i in {1..50}; do
             az network nsg rule delete \
               --resource-group $RESOURCE_GROUP \
               --nsg-name $NSG_NAME \
@@ -83,7 +80,7 @@ jobs:
           for chunk_file in ip_chunk_*; do
             echo "Processing $chunk_file (Rule $rule_number)..."
             
-            # Convert chunk to comma-separated list
+            # Convert chunk to comma-separated list, handling it more carefully
             CHUNK_IPS=$(cat "$chunk_file" | tr '\n' ',' | sed 's/,$//')
             
             # Create rule name with number suffix
@@ -95,15 +92,17 @@ jobs:
             
             echo "Creating rule: $RULE_NAME with priority $priority"
             echo "IP ranges in this rule: $(cat "$chunk_file" | wc -l)"
+            echo "First few IPs in chunk: $(head -3 "$chunk_file" | tr '\n' ',' | sed 's/,$//')"
             
+            # Create the rule with comma-separated IP list
             az network nsg rule create \
-              --resource-group $RESOURCE_GROUP \
-              --nsg-name $NSG_NAME \
+              --resource-group "$RESOURCE_GROUP" \
+              --nsg-name "$NSG_NAME" \
               --name "$RULE_NAME" \
               --protocol Tcp \
               --direction Inbound \
               --priority $priority \
-              --source-address-prefixes $CHUNK_IPS \
+              --source-address-prefixes "$CHUNK_IPS" \
               --source-port-ranges '*' \
               --destination-address-prefixes '*' \
               --destination-port-ranges 22 \
