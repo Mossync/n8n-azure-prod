@@ -1,0 +1,177 @@
+name: Update Domain Configuration on Azure VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Custom domain to configure (e.g., n8n.techbrew.dev)'
+        required: true
+        default: 'n8n.techbrew.dev'
+        type: string
+
+jobs:
+  update-domain:
+    runs-on: ubuntu-latest
+    env:
+      RESOURCE_GROUP: Mossync-n8n-prod
+      KEYVAULT_NAME: n8n-keyvault-prod
+      SSH_KEY_NAME: n8n-ssh-key
+      VM_NAME: n8n-vm
+      ADMIN_USERNAME: mossn8nadmin
+      CUSTOM_DOMAIN: ${{ inputs.domain }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Check if VM exists
+        run: |
+          if ! az vm show --resource-group $RESOURCE_GROUP --name $VM_NAME >/dev/null 2>&1; then
+            echo "Error: VM $VM_NAME does not exist in resource group $RESOURCE_GROUP"
+            exit 1
+          fi
+          echo "VM $VM_NAME found. Proceeding with domain update..."
+
+      - name: Get VM Info
+        run: |
+          VM_IP=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query publicIps -o tsv)
+          VM_FQDN=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query fqdns -o tsv)
+          echo "VM Public IP: $VM_IP"
+          echo "VM FQDN: $VM_FQDN"
+          echo "Custom Domain: $CUSTOM_DOMAIN"
+          echo "VM_IP=$VM_IP" >> $GITHUB_ENV
+          echo "VM_FQDN=$VM_FQDN" >> $GITHUB_ENV
+
+      - name: Retrieve SSH Private Key from Key Vault
+        run: |
+          az keyvault secret download --vault-name $KEYVAULT_NAME --name $SSH_KEY_NAME-private --file id_rsa_n8n --overwrite
+          chmod 600 id_rsa_n8n
+
+      - name: Test SSH Connectivity
+        run: |
+          echo "Testing SSH connectivity to VM..."
+          for i in {1..10}; do
+            if ssh -i id_rsa_n8n -o StrictHostKeyChecking=no -o ConnectTimeout=10 $ADMIN_USERNAME@$VM_IP "echo 'SSH connection successful'" 2>/dev/null; then
+              echo "SSH connection to VM successful"
+              break
+            fi
+            echo "SSH attempt $i/10 failed, retrying..."
+            sleep 10
+          done
+
+      - name: Create and Upload Caddy Configuration
+        run: |
+          echo "Creating Caddy configuration for domain: $CUSTOM_DOMAIN"
+          echo "$CUSTOM_DOMAIN {" > caddyfile_new
+          echo "    log {" >> caddyfile_new
+          echo "        output stderr" >> caddyfile_new
+          echo "        format console" >> caddyfile_new
+          echo "        level DEBUG" >> caddyfile_new
+          echo "    }" >> caddyfile_new
+          echo "    " >> caddyfile_new
+          echo "    header {" >> caddyfile_new
+          echo "        Strict-Transport-Security \"max-age=31536000; includeSubDomains\"" >> caddyfile_new
+          echo "        Permissions-Policy \"interest-cohort=()\"" >> caddyfile_new
+          echo "        X-XSS-Protection \"1; mode=block\"" >> caddyfile_new
+          echo "        X-Frame-Options \"SAMEORIGIN\"" >> caddyfile_new
+          echo "        X-Content-Type-Options \"nosniff\"" >> caddyfile_new
+          echo "    }" >> caddyfile_new
+          echo "" >> caddyfile_new
+          echo "    reverse_proxy localhost:5678 {" >> caddyfile_new
+          echo "        header_up X-Forwarded-Proto \"https\"" >> caddyfile_new
+          echo "        header_up X-Forwarded-For {remote_host}" >> caddyfile_new
+          echo "        header_up Host {host}" >> caddyfile_new
+          echo "    }" >> caddyfile_new
+          echo "}" >> caddyfile_new
+          
+          # Upload to VM
+          scp -i id_rsa_n8n -o StrictHostKeyChecking=no caddyfile_new $ADMIN_USERNAME@$VM_IP:/tmp/Caddyfile
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "sudo mv /tmp/Caddyfile /etc/caddy/Caddyfile"
+
+      - name: Update n8n Environment Configuration
+        run: |
+          echo "Updating n8n environment configuration..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            cd n8n
+            echo 'N8N_HOST=$CUSTOM_DOMAIN' > .env
+            echo 'N8N_PROTOCOL=https' >> .env
+            echo 'N8N_PORT=5678' >> .env
+            echo 'WEBHOOK_URL=https://$CUSTOM_DOMAIN' >> .env
+            echo 'NODE_ENV=production' >> .env
+            echo 'GENERIC_TIMEZONE=UTC' >> .env
+            echo '.env file updated successfully'
+            cat .env
+          "
+
+      - name: Restart Caddy Service
+        run: |
+          echo "Restarting Caddy service..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            sudo systemctl restart caddy
+            sleep 5
+            sudo systemctl status caddy --no-pager
+          "
+
+      - name: Restart n8n Containers
+        run: |
+          echo "Restarting n8n containers with new domain configuration..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            cd n8n
+            docker-compose down
+            docker-compose up -d
+          "
+
+      - name: Wait for Services to Start
+        run: |
+          echo "Waiting for services to fully start..."
+          sleep 60
+
+      - name: Verify Domain Configuration
+        run: |
+          echo "Verifying domain configuration..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            cd n8n && docker-compose ps
+            echo ''
+            sudo systemctl is-active caddy
+            echo ''
+            curl -f http://localhost:5678/healthz || echo 'n8n health check returned non-zero (may be normal during startup)'
+          "
+
+      - name: Display Success Information
+        run: |
+          echo "================================================"
+          echo "🎉 Domain Update Complete!"
+          echo "================================================"
+          echo ""
+          echo "Configuration Summary:"
+          echo "  • Custom Domain: $CUSTOM_DOMAIN"
+          echo "  • VM IP Address: $VM_IP"
+          echo "  • Azure FQDN: $VM_FQDN"
+          echo ""
+          echo "Services Updated:"
+          echo "  ✅ Caddy reverse proxy configured for $CUSTOM_DOMAIN"
+          echo "  ✅ n8n environment variables updated"
+          echo "  ✅ SSL certificate will be auto-generated by Caddy"
+          echo "  ✅ All containers restarted with new configuration"
+          echo ""
+          echo "Next Steps:"
+          echo "  1. Ensure your DNS (Cloudflare) points $CUSTOM_DOMAIN to $VM_IP"
+          echo "  2. Wait 5-10 minutes for SSL certificate generation"
+          echo "  3. Access your n8n instance at: https://$CUSTOM_DOMAIN"
+          echo ""
+          echo "================================================"
+
+      - name: Test External Domain Access
+        run: |
+          echo "Testing external domain access (this may fail if DNS isn't propagated yet)..."
+          sleep 30
+          if curl -f -k --connect-timeout 30 https://$CUSTOM_DOMAIN/healthz 2>/dev/null; then
+            echo "✅ SUCCESS: $CUSTOM_DOMAIN is accessible!"
+          else
+            echo "⚠️  Domain not yet accessible externally (DNS propagation may still be in progress)"
+            echo "   This is normal - please wait a few minutes and try accessing: https://$CUSTOM_DOMAIN"
+          fi
