@@ -57,7 +57,7 @@
             "name": "[variables('publicIPAddressName')]",
             "location": "[resourceGroup().location]",
             "sku": {
-                "name": "Basic"
+                "name": "Standard"
             },
             "properties": {
                 "publicIPAllocationMethod": "Dynamic",
@@ -210,4 +210,4 @@
             "value": "[reference(variables('publicIPAddressName')).dnsSettings.fqdn]"
         }
     }
-} 
+}
