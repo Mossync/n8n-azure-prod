@@ -1,0 +1,65 @@
+name: Azure VM Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      RESOURCE_GROUP: Mossync-n8n-prod
+      LOCATION: westus3
+      KEYVAULT_NAME: n8n-keyvault-prod
+      SSH_KEY_NAME: n8n-ssh-key
+      VM_NAME: n8n-vm
+      ADMIN_USERNAME: mossn8nadmin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Ensure Resource Group Exists
+        run: |
+          az group show --name $RESOURCE_GROUP || az group create --name $RESOURCE_GROUP --location $LOCATION
+
+      - name: Ensure Key Vault Exists
+        run: |
+          az keyvault show --name $KEYVAULT_NAME --resource-group $RESOURCE_GROUP || \
+          az keyvault create --name $KEYVAULT_NAME --resource-group $RESOURCE_GROUP --location $LOCATION
+
+      - name: Ensure SSH Key Exists in Key Vault
+        run: |
+          if ! az keyvault secret show --vault-name $KEYVAULT_NAME --name $SSH_KEY_NAME-public; then
+            ssh-keygen -t rsa -b 4096 -N "" -f id_rsa_n8n
+            az keyvault secret set --vault-name $KEYVAULT_NAME --name $SSH_KEY_NAME-public --file id_rsa_n8n.pub
+            az keyvault secret set --vault-name $KEYVAULT_NAME --name $SSH_KEY_NAME-private --file id_rsa_n8n
+          fi
+
+      - name: Retrieve SSH Public Key from Key Vault
+        run: |
+          az keyvault secret download --vault-name $KEYVAULT_NAME --name $SSH_KEY_NAME-public --file id_rsa_n8n.pub
+          PUB_KEY=$(cat id_rsa_n8n.pub)
+          echo "PUB_KEY<<EOF" >> $GITHUB_ENV
+          echo "$PUB_KEY" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Deploy ARM Template
+        run: |
+          DNS_PREFIX=n8n-${{ github.run_id }}
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file n8n-vm-template.json \
+            --parameters \
+              vmName=$VM_NAME \
+              adminUsername=$ADMIN_USERNAME \
+              adminPasswordOrKey="${{ env.PUB_KEY }}" \
+              dnsLabelPrefix=$DNS_PREFIX
+
+      - name: Get VM Public IP
+        run: |
+          VM_IP=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query publicIps -o tsv)
+          echo "VM Public IP: $VM_IP"
