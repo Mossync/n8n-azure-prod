@@ -55,17 +55,116 @@ jobs:
             sleep 10
           done
 
-      - name: Create Backup Before Update
+      - name: System Health Check
         run: |
-          echo "Creating backup before update..."
+          echo "Performing system health check..."
           ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
-            cd n8n
-            echo 'Creating backup before update...'
-            docker-compose exec -T postgres pg_dump -U n8n n8n > backup_before_update_\$(date +%Y%m%d_%H%M%S).sql
-            echo 'Backup created successfully'
+            echo 'System uptime:'
+            uptime
+            echo ''
+            echo 'Disk usage:'
+            df -h
+            echo ''
+            echo 'Memory usage:'
+            free -h
+            echo ''
+            echo 'Current kernel version:'
+            uname -r
           "
 
-      - name: Update n8n and PostgreSQL
+      - name: Update Package Lists and Check Available Updates
+        run: |
+          echo "Checking for available system updates..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            echo 'Updating package lists...'
+            sudo apt update
+            echo ''
+            echo 'Checking for security updates...'
+            apt list --upgradable | grep -i security || echo 'No security updates available'
+            echo ''
+            echo 'Checking for all available updates...'
+            apt list --upgradable | head -20
+          "
+
+      - name: Create System Backup Before Updates
+        run: |
+          echo "Creating comprehensive backup before updates..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            # Create backup directory
+            BACKUP_DIR=\"backups/\$(date +%Y%m%d_%H%M%S)\"
+            mkdir -p \$BACKUP_DIR
+            
+            # Database backup
+            cd n8n
+            echo 'Creating database backup...'
+            docker-compose exec -T postgres pg_dump -U n8n n8n > ../\$BACKUP_DIR/n8n_database.sql
+            
+            # Configuration backups
+            echo 'Backing up configurations...'
+            sudo cp /etc/caddy/Caddyfile ../\$BACKUP_DIR/Caddyfile.backup
+            cp .env ../\$BACKUP_DIR/n8n.env.backup
+            cp docker-compose.yml ../\$BACKUP_DIR/docker-compose.yml.backup
+            
+            # System info backup
+            echo 'Saving system information...'
+            dpkg --get-selections > ../\$BACKUP_DIR/installed_packages.txt
+            sudo systemctl list-units --state=active > ../\$BACKUP_DIR/active_services.txt
+            
+            echo \"Backup completed in: \$BACKUP_DIR\"
+          "
+
+      - name: Install Security Updates Only
+        run: |
+          echo "Installing critical security updates..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            echo 'Installing unattended security upgrades...'
+            sudo apt install -y unattended-upgrades
+            
+            echo 'Configuring automatic security updates...'
+            echo 'Unattended-Upgrade::Allowed-Origins {' | sudo tee /etc/apt/apt.conf.d/50unattended-upgrades-security
+            echo '  \"\${distro_id}:\${distro_codename}-security\";' | sudo tee -a /etc/apt/apt.conf.d/50unattended-upgrades-security
+            echo '};' | sudo tee -a /etc/apt/apt.conf.d/50unattended-upgrades-security
+            
+            echo 'Running security updates...'
+            sudo unattended-upgrades -d --dry-run
+            sudo unattended-upgrades -d
+            
+            echo 'Installing additional critical updates...'
+            sudo apt upgrade -y --with-new-pkgs -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold'
+          "
+
+      - name: Update Docker and System Components
+        run: |
+          echo "Updating Docker and system components..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            echo 'Checking Docker version...'
+            docker --version
+            
+            echo 'Updating Docker if available...'
+            if apt list --upgradable 2>/dev/null | grep -q docker; then
+              echo 'Docker update available, installing...'
+              sudo apt update
+              sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            else
+              echo 'Docker is up to date'
+            fi
+            
+            echo 'Updating Caddy if available...'
+            if which caddy >/dev/null 2>&1; then
+              if apt list --upgradable 2>/dev/null | grep -q caddy; then
+                echo 'Caddy update available, installing...'
+                sudo apt install -y caddy
+              else
+                echo 'Caddy is up to date'
+              fi
+            fi
+            
+            echo 'Cleaning up package cache...'
+            sudo apt autoremove -y
+            sudo apt autoclean
+          "
+
+      - name: Update n8n and PostgreSQL Containers
         run: |
           echo "Updating n8n and PostgreSQL containers..."
           ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
@@ -74,7 +173,35 @@ jobs:
             docker-compose pull
             echo 'Restarting containers with updated images...'
             docker-compose up -d
-            echo 'Update completed successfully'
+            echo 'Container updates completed successfully'
+          "
+
+      - name: Check if Reboot Required
+        run: |
+          echo "Checking if system reboot is required..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "
+            if [ -f /var/run/reboot-required ]; then
+              echo '⚠️  REBOOT REQUIRED after updates'
+              echo 'Reason:'
+              cat /var/run/reboot-required.pkgs || echo 'Reboot required file exists but no package list found'
+              echo ''
+              echo 'A reboot will be required to complete some updates.'
+              echo 'Consider scheduling a maintenance window for reboot.'
+            else
+              echo '✅ No reboot required'
+            fi
+            
+            echo ''
+            echo 'New kernel available check:'
+            CURRENT_KERNEL=\$(uname -r)
+            LATEST_KERNEL=\$(ls /boot/vmlinuz-* | sort -V | tail -n1 | sed 's/.*vmlinuz-//')
+            if [ \"\$CURRENT_KERNEL\" != \"\$LATEST_KERNEL\" ]; then
+              echo \"Current kernel: \$CURRENT_KERNEL\"
+              echo \"Latest kernel:  \$LATEST_KERNEL\"
+              echo '⚠️  Kernel update available - reboot recommended'
+            else
+              echo \"Kernel is up to date: \$CURRENT_KERNEL\"
+            fi
           "
 
       - name: Verify Services are Running
