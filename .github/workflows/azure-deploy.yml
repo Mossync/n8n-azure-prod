@@ -47,19 +47,55 @@ jobs:
           echo "$PUB_KEY" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      - name: Deploy ARM Template
+      - name: Check if VM exists and Deploy if needed
         run: |
-          DNS_PREFIX=n8n-${{ github.run_id }}
-          az deployment group create \
-            --resource-group $RESOURCE_GROUP \
-            --template-file n8n-vm-template.json \
-            --parameters \
-              vmName=$VM_NAME \
-              adminUsername=$ADMIN_USERNAME \
-              adminPasswordOrKey="${{ env.PUB_KEY }}" \
-              dnsLabelPrefix=$DNS_PREFIX
+          if az vm show --resource-group $RESOURCE_GROUP --name $VM_NAME >/dev/null 2>&1; then
+            echo "VM $VM_NAME already exists. Skipping deployment."
+          else
+            echo "VM $VM_NAME does not exist. Deploying..."
+            DNS_PREFIX=n8n-${{ github.run_id }}
+            az deployment group create \
+              --resource-group $RESOURCE_GROUP \
+              --template-file n8n-vm-template.json \
+              --parameters \
+                vmName=$VM_NAME \
+                adminUsername=$ADMIN_USERNAME \
+                adminPasswordOrKey="${{ env.PUB_KEY }}" \
+                dnsLabelPrefix=$DNS_PREFIX
+          fi
 
-      - name: Get VM Public IP
+      - name: Get VM Info and Complete Setup
         run: |
           VM_IP=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query publicIps -o tsv)
+          VM_FQDN=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query fqdns -o tsv)
           echo "VM Public IP: $VM_IP"
+          echo "VM FQDN: $VM_FQDN"
+          
+          # Retrieve SSH private key from Key Vault
+          az keyvault secret download --vault-name $KEYVAULT_NAME --name $SSH_KEY_NAME-private --file id_rsa_n8n --overwrite
+          chmod 600 id_rsa_n8n
+          
+          # Wait for VM to be ready (SSH accessible)
+          echo "Waiting for VM to be ready..."
+          for i in {1..30}; do
+            if ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "echo 'VM is ready'" 2>/dev/null; then
+              echo "VM is ready for setup"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 30
+          done
+          
+          # Copy setup files to VM
+          echo "Copying setup files to VM..."
+          scp -i id_rsa_n8n -o StrictHostKeyChecking=no setup.sh docker-compose.yml backup.sh $ADMIN_USERNAME@$VM_IP:~/
+          
+          # Run setup with VM FQDN as domain
+          echo "Running setup on VM with domain: $VM_FQDN"
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "chmod +x setup.sh && ./setup.sh $VM_FQDN"
+          
+          # Start containers
+          echo "Starting n8n containers..."
+          ssh -i id_rsa_n8n -o StrictHostKeyChecking=no $ADMIN_USERNAME@$VM_IP "cd n8n && docker-compose up -d"
+          
+          echo "n8n setup complete! Access your instance at: https://$VM_FQDN"

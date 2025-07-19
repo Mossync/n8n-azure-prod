@@ -22,8 +22,14 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo 
 sudo apt update
 sudo apt install caddy
 
-# Prompt for domain name
-read -p "Enter your domain name: " domain_name
+# Get domain name from argument, environment variable, or prompt
+if [ -n "$1" ]; then
+  domain_name="$1"
+elif [ -n "$DOMAIN_NAME" ]; then
+  domain_name="$DOMAIN_NAME"
+else
+  read -p "Enter your domain name: " domain_name
+fi
 
 # Create Caddyfile with user's domain
 cat << EOF | sudo tee /etc/caddy/Caddyfile
@@ -73,4 +79,4 @@ echo "N8N_PORT=5678" >> .env
 
 # Notify user to log out and back in
 echo "Setup complete! Please log out and log back in for docker permissions to take effect."
-echo "Then run 'docker-compose up -d' in the n8n directory to start the containers." 
+echo "Then run 'docker-compose up -d' in the n8n directory to start the containers."
